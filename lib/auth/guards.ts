@@ -4,7 +4,6 @@ export const ROLE_HOME: Record<UserRole, string> = {
   ambulance_driver: "/ambulance",
   traffic_police: "/police",
   admin: "/admin",
-  police: "/police",
 };
 
 export const ROLE_LABEL: Record<UserRole, string> = {

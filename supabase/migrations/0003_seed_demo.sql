@@ -1,31 +1,207 @@
--- OPTIONAL demo data (Colombo area, approximate coordinates) for local testing.
--- Skip or delete this migration for a clean production deployment; manage real
--- records through the /admin dashboard instead.
+-- Bangalore seed data for RapidRoute.
+-- Used to provide an initial local dataset for development/testing.
+-- In production, manage operational records through the admin dashboard.
 
-insert into public.hospitals (name, address, phone, emergency_capability, latitude, longitude)
-select * from (values
-  ('National Hospital of Sri Lanka', 'Regency Road, Colombo 01000', '+94 11 269 1111', 'Trauma | Cardiac | Neuro (demo)', 6.9169, 79.8636),
-  ('Asiri Central Hospital', '181 Norris Canal Road, Colombo 01000', '+94 11 452 4444', 'General emergency (demo)', 6.9215, 79.8630),
-  ('Lanka Hospitals', '578 Elvitigala Mawatha, Colombo 00500', '+94 11 553 1111', 'Cardiac | ICU (demo)', 6.9019, 79.8640),
-  ('Durdans Hospital', '3 Alfred Place, Colombo 00300', '+94 11 552 2141', 'General emergency (demo)', 6.9142, 79.8505)
-) as h(name, address, phone, emergency_capability, latitude, longitude)
-where not exists (select 1 from public.hospitals);
+-- ============================================================
+-- HOSPITALS
+-- ============================================================
 
-insert into public.junctions (name, latitude, longitude, geofence_radius)
-select * from (values
-  ('Borella Junction', 6.9147, 79.8776, 500),
-  ('Town Hall Junction', 6.9165, 79.8637, 500),
-  ('Kollupitiya Junction', 6.9065, 79.8487, 500),
-  ('Bambalapitiya Junction', 6.8917, 79.8565, 500),
-  ('Wellawatte Junction', 6.8749, 79.8606, 500),
-  ('Slave Island Junction', 6.9250, 79.8508, 500)
-) as j(name, latitude, longitude, geofence_radius)
-where not exists (select 1 from public.junctions);
+insert into public.hospitals (
+  name,
+  address,
+  phone,
+  emergency_capability,
+  latitude,
+  longitude
+)
+select * from (
+  values
 
-insert into public.ambulances (vehicle_number, driver_id, status)
-select * from (values
+  (
+    'Victoria Hospital',
+    'Near City Market, Fort Road, Bengaluru, Karnataka 560002',
+    '080-26701150',
+    'General Emergency | Trauma | Burns',
+    12.963389,
+    77.573819
+  ),
+
+  (
+    'St. John''s Medical College Hospital',
+    'Sarjapur Main Road, Bengaluru, Karnataka 560034',
+    '080-25530724',
+    'Emergency | Trauma | Cardiac | ICU',
+    12.929650,
+    77.618698
+  ),
+
+  (
+    'M.S. Ramaiah Memorial Hospital',
+    'New BEL Road, M.S. Ramaiah Nagar, Bengaluru, Karnataka 560054',
+    '080-23608888',
+    'Emergency | Trauma | ICU',
+    13.028545,
+    77.569479
+  ),
+
+  (
+    'St. Philomena''s Hospital',
+    'No. 4, Mother Theresa Road, Vivek Nagar, Bengaluru, Karnataka 560047',
+    '080-40164433',
+    'Emergency | General',
+    12.965323,
+    77.611051
+  ),
+
+  (
+    'Vanivilas Women and Children Hospital',
+    'Krishnarajendra Road, Bengaluru, Karnataka',
+    '080-26705206',
+    'Emergency | Women | Children',
+    12.962138,
+    77.573752
+  ),
+
+  (
+    'St. Martha''s Heart Centre',
+    '5, Nrupathunga Road, Bengaluru, Karnataka 560001',
+    '18602080208',
+    'Cardiac Emergency | ICU',
+    12.970788,
+    77.586195
+  ),
+
+  (
+    'Mallya Hospital',
+    'No. 2, Vittal Mallya Road, Ashok Nagar, Bengaluru, Karnataka 560001',
+    '080-22277979',
+    'Emergency | General | ICU',
+    12.968183,
+    77.594985
+  ),
+
+  -- (
+  --   'Manipal Hospital Old Airport Road',
+  --   '98, HAL Airport Road, Kodihalli, Bengaluru, Karnataka 560017',
+  --   '080-25268901',
+  --   'Emergency | Trauma | Cardiac | ICU',
+  --   12.959127,
+  --   77.647366
+  -- )
+ as h(
+  name,
+  address,
+  phone,
+  emergency_capability,
+  latitude,
+  longitude
+)
+where not exists (
+  select 1 from public.hospitals
+);
+
+
+-- ============================================================
+-- JUNCTIONS
+-- ============================================================
+
+insert into public.junctions (
+  name,
+  latitude,
+  longitude,
+  geofence_radius
+)
+select * from (
+  values
+
+  (
+    'Trinity Circle',
+    12.97278,
+    77.62058,
+    500
+  ),
+
+  (
+    'Richmond Circle',
+    12.96758,
+    77.59958,
+    500
+  ),
+
+  (
+    'Mekhri Circle',
+    13.02005,
+    77.58402,
+    500
+  ),
+
+  (
+    'Silk Board Junction',
+    12.91700,
+    77.62300,
+    500
+  ),
+
+  (
+    'Ejipura Junction',
+    12.93863,
+    77.63346,
+    500
+  ),
+
+  (
+    'KR Market Junction',
+    12.96571,
+    77.57627,
+    500
+  ),
+
+  (
+    'Shivajinagar Junction',
+    12.98553,
+    77.60545,
+    500
+  ),
+
+  (
+    'Srinivagilu Junction',
+    12.93827,
+    77.63284,
+    500
+  )
+
+) as j(
+  name,
+  latitude,
+  longitude,
+  geofence_radius
+)
+where not exists (
+  select 1 from public.junctions
+);
+
+
+-- ============================================================
+-- AMBULANCES
+-- ============================================================
+
+insert into public.ambulances (
+  vehicle_number,
+  driver_id,
+  status
+)
+select * from (
+  values
+
   ('RR-101', null::uuid, 'AVAILABLE'),
   ('RR-104', null::uuid, 'AVAILABLE'),
   ('RR-112', null::uuid, 'AVAILABLE')
-) as a(vehicle_number, driver_id, status)
-where not exists (select 1 from public.ambulances);
+
+) as a(
+  vehicle_number,
+  driver_id,
+  status
+)
+where not exists (
+  select 1 from public.ambulances
+);

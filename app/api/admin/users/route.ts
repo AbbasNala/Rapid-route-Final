@@ -78,15 +78,27 @@ export async function POST(request: Request) {
       { status: 409 },
     );
   }
-  const { error: insertError } = await guard
+  const { error: profileError } = await guard
     .admin!.from("users")
-    .insert({ id: created.user.id, name, email, role });
-  if (insertError) {
+    .update({
+      name,
+      email,
+      role,
+    })
+    .eq("id", created.user.id);
+
+  if (profileError) {
     return NextResponse.json(
-      { error: "Profile insert failed: " + insertError.message },
+      { error: "Profile update failed: " + profileError.message },
       { status: 500 },
     );
   }
+  // if (insertError) {
+  //   return NextResponse.json(
+  //     { error: "Profile insert failed: " + insertError.message },
+  //     { status: 500 },
+  //   );
+  // }
   await guard.admin!.from("audit_log").insert({
     actor: guard.actorId,
     action: "admin.user.create",

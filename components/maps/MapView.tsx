@@ -18,11 +18,10 @@ import {
 } from "react-leaflet";
 import { cn } from "@/lib/utils";
 
-const TILE_URL =
-  "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
-// Standard OSM tiles alternative: "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+
 const TILE_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noreferrer">CARTO</a>';
+  '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors';
 
 export type JunctionMapState =
   | "monitoring"
@@ -175,7 +174,8 @@ export default function MapView({
     const c = ambulances[0]?.position ??
       routes[0]?.points?.[0] ??
       junctions[0]?.position ??
-      hospitals[0]?.position ?? [6.9148, 79.864]; // demo seed area fallback
+      hospitals[0]?.position ?? [12.9716, 77.5946];
+
     return [c[0], c[1]];
   }, [ambulances, routes, junctions, hospitals]);
 
