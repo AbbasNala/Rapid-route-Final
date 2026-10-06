@@ -1,598 +1,956 @@
 "use client";
-
-import { useEffect, useMemo, useState } from "react";
+// Driver console — mobile-first, minimal interaction while driving.
+// SELECT → PREVIEW → ACTIVE. Real GPS via LocationTracker (throttled writes),
+// real routing via /api/routing, real alerts loop back from the police through
+// Supabase Realtime (journey-scoped channel).
+import * as React from "react";
 import { useRouter } from "next/navigation";
 import {
-  Ambulance,
+  AlertTriangle,
   CheckCircle2,
-  ChevronLeft,
-  Hospital,
-  LocateFixed,
+  Cross,
+  Gauge,
   LogOut,
-  Pause,
-  Play,
+  Navigation,
+  Radio,
   Route as RouteIcon,
-  ShieldCheck,
+  Search,
   Siren,
-  TriangleAlert,
+  Satellite,
+  TrafficCone,
+  X,
 } from "lucide-react";
-import MapPanel from "@/components/maps/MapPanel";
-import { RoadblockSheet } from "./RoadblockSheet";
-import { HospitalPicker } from "./HospitalPicker";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Chip, StatusDot } from "@/components/ui/badge";
-import { Modal } from "@/components/ui/modal";
-import { Toast } from "@/components/ui/toast";
-import { Splash } from "@/components/Splash";
-import { store, useAppState, useHydrated } from "@/lib/store";
+import { Input, Label, Textarea } from "@/components/ui/form";
+import { useToast } from "@/components/ui/toast";
+import { DynamicMap, type MapViewProps } from "@/components/maps/DynamicMap";
+import { createClient } from "@/lib/supabase/client";
 import {
-  getActiveJourneyFor,
-  getJourneyStats,
-  getUpcomingJunctions,
-  getAlertForJourneyJunction,
-} from "@/lib/selectors";
-import { fmtDistance, fmtEta } from "@/lib/format";
-import { cn } from "@/lib/utils";
+  LocationTracker,
+  type TrackerState,
+} from "@/lib/location/locationTracker";
+import { createBrowserLocationProvider } from "@/lib/location/browserLocationProvider";
+import type { LocationFix } from "@/lib/location/locationProvider";
+import { haversineMeters } from "@/lib/geofencing/haversine";
+import { estimateEtaSeconds } from "@/lib/geofencing/alertRules";
+import {
+  fromGeoJson,
+  junctionsWithRouteDistance,
+  routeEta,
+  toGeoJson,
+  type RoutePoint,
+} from "@/lib/routing/routeGeometry";
+import type { DrivingRoute } from "@/lib/routing/routingProvider";
+import { useNow } from "@/lib/hooks";
+import { cn, fmtDistance, fmtDuration, fmtSpeed, timeAgo } from "@/lib/utils";
+import type {
+  AlertsRow,
+  AmbulancesRow,
+  HospitalsRow,
+  IncidentType,
+  JunctionsRow,
+} from "@/types/database";
 
-const SPEEDS = [2, 6, 12];
+type Phase = "SELECT" | "PREVIEW" | "ACTIVE";
+const INCIDENT_TYPES: Array<{ value: IncidentType; label: string }> = [
+  { value: "ACCIDENT", label: "Accident" },
+  { value: "ROAD_BLOCKED", label: "Road blocked" },
+  { value: "HEAVY_TRAFFIC", label: "Heavy traffic" },
+  { value: "CONSTRUCTION", label: "Construction" },
+  { value: "OTHER", label: "Other" },
+];
 
-export default function AmbulanceConsole() {
-  const state = useAppState();
-  const hydrated = useHydrated();
+interface Props {
+  driverId: string;
+  ambulances: AmbulancesRow[];
+  hospitals: HospitalsRow[];
+  junctions: JunctionsRow[];
+}
+
+export function AmbulanceConsole({
+  driverId,
+  ambulances,
+  hospitals,
+  junctions,
+}: Props) {
+  const supabase = React.useMemo(() => createClient(), []);
+  const toast = useToast();
   const router = useRouter();
-  const [toast, setToast] = useState<string | null>(null);
-  const [roadblockOpen, setRoadblockOpen] = useState(false);
-  const [endConfirm, setEndConfirm] = useState(false);
-  const [gpsOn, setGpsOn] = useState(false);
-  const [starting, setStarting] = useState(false);
-  const [recenter, setRecenter] = useState(0);
+  const now = useNow(1000);
 
-  const session = state.session;
-  const amb = state.ambulances.find((a) => a.id === session?.ambulanceId);
+  const [phase, setPhase] = React.useState<Phase>("SELECT");
+  const [vehicleId, setVehicleId] = React.useState(ambulances[0]?.id ?? null);
+  const [hospitalId, setHospitalId] = React.useState<string | null>(null);
+  const [search, setSearch] = React.useState("");
+  const [route, setRoute] = React.useState<DrivingRoute | null>(null);
+  const [routing, setRouting] = React.useState(false);
+  const [journeyId, setJourneyId] = React.useState<string | null>(null);
+  const [fix, setFix] = React.useState<LocationFix | null>(null);
+  const [trk, setTrk] = React.useState<TrackerState | null>(null);
+  const [etaS, setEtaS] = React.useState<number | null>(null);
+  const [remainingM, setRemainingM] = React.useState<number | null>(null);
+  const [fromRouteM, setFromRouteM] = React.useState(0);
+  const [alerts, setAlerts] = React.useState<AlertsRow[]>([]);
+  const [netStatus, setNetStatus] = React.useState<string>("connecting");
+  const [sheetOpen, setSheetOpen] = React.useState(false);
+  const [fitToken, setFitToken] = React.useState(0);
 
-  useEffect(() => {
-    if (hydrated && (!session || session.role !== "ambulance_driver" || !amb))
-      router.replace("/");
-  }, [hydrated, session, amb, router]);
+  const routeRef = React.useRef<RoutePoint[]>([]);
+  const journeyIdRef = React.useRef<string | null>(null);
+  const acceptedRef = React.useRef<
+    (f: LocationFix, meta: { computedHeading: number | null }) => void
+  >(() => {});
 
-  // keep the simulation alive / take it over if the driving tab was refreshed
-  useEffect(() => {
-    store.init();
-    const t = setInterval(() => store.heartbeat(), 5000);
-    return () => clearInterval(t);
+  const vehicle = ambulances.find((a) => a.id === vehicleId) ?? null;
+  const hospital = hospitals.find((h) => h.id === hospitalId) ?? null;
+
+  /* ── GPS tracking (real Geolocation API, throttled) ─────────────────── */
+  React.useEffect(() => {
+    const provider = createBrowserLocationProvider();
+    const tracker = new LocationTracker(
+      provider,
+      {
+        minIntervalMs: Number(
+          process.env.NEXT_PUBLIC_GPS_MIN_INTERVAL_MS ?? 5000,
+        ),
+        minDistanceM: Number(process.env.NEXT_PUBLIC_GPS_MIN_DISTANCE_M ?? 15),
+      },
+      (f, meta) => acceptedRef.current(f, meta),
+    );
+    const unsub = tracker.subscribe(setTrk);
+    tracker.start();
+    return () => {
+      unsub();
+      tracker.stop();
+    };
   }, []);
 
-  // switch to live OpenStreetMap data on load
-  useEffect(() => {
-    if (!hydrated || !session?.ambulanceId) return;
-    const a = store
-      .getState()
-      .ambulances.find((x) => x.id === session.ambulanceId);
-    if (a) void store.loadHospitals([a.lat, a.lng]);
-  }, [hydrated, session?.ambulanceId]);
+  const onAccepted = React.useCallback(
+    (f: LocationFix, meta: { computedHeading: number | null }) => {
+      const headed = { ...f, heading: f.heading ?? meta.computedHeading };
+      setFix(headed);
+      const pts = routeRef.current;
+      const jid = journeyIdRef.current;
+      if (!jid || pts.length < 2) return;
 
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(null), 3500);
-    return () => clearTimeout(t);
-  }, [toast]);
+      const est = routeEta(
+        pts,
+        [headed.latitude, headed.longitude],
+        route?.durationS ?? null,
+      );
+      setRemainingM(est.remainingM);
+      setEtaS(est.etaS);
+      setFromRouteM(est.fromRouteM);
 
-  function handleNearMe() {
-    if (!amb) return;
-    if (!navigator.geolocation) {
-      setToast("Geolocation is not supported here");
+      void supabase
+        .from("location_updates")
+        .insert({
+          journey_id: jid,
+          latitude: headed.latitude,
+          longitude: headed.longitude,
+          speed: headed.speed,
+          heading: headed.heading,
+          accuracy: headed.accuracy,
+        })
+        .then(({ error }) => {
+          if (error)
+            toast.error("Failed to send location update: " + error.message);
+        });
+    },
+    [supabase, toast, route?.durationS],
+  );
+  React.useEffect(() => {
+    acceptedRef.current = onAccepted;
+  }, [onAccepted]);
+
+  /* ── Resume an ACTIVE journey after a page refresh ──────────────────── */
+  React.useEffect(() => {
+    (async () => {
+      const { data } = await supabase
+        .from("journeys")
+        .select("*")
+        .eq("status", "ACTIVE")
+        .order("created_at", { ascending: false })
+        .limit(5);
+      const rows = (data ?? []) as Array<{
+        id: string;
+        ambulance_id: string;
+        destination_hospital_id: string;
+        route_geometry: unknown;
+        distance: number | null;
+        estimated_duration: number | null;
+      }>;
+      const mine = rows.find((j) =>
+        ambulances.some((a) => a.id === j.ambulance_id),
+      );
+      if (!mine) return;
+      const pts = fromGeoJson(mine.route_geometry);
+      routeRef.current = pts;
+      journeyIdRef.current = mine.id;
+      setJourneyId(mine.id);
+      setVehicleId(mine.ambulance_id);
+      setHospitalId(mine.destination_hospital_id);
+      setRoute({
+        geometry: pts,
+        distanceM: mine.distance ?? 0,
+        durationS: mine.estimated_duration ?? 0,
+        provider: "restored",
+      });
+      setPhase("ACTIVE");
+      subscribeJourney(mine.id);
+      toast.info("Active emergency journey resumed.");
+    })();
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function subscribeJourney(id: string) {
+    const channel = supabase
+      .channel(`journey-${id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "alerts",
+          filter: `journey_id=eq.${id}`,
+        },
+        (payload) => {
+          const row = payload.new as AlertsRow | null;
+          if (!row) return;
+          setAlerts((prev) => {
+            const i = prev.findIndex((a) => a.id === row.id);
+            if (i === -1) return [row, ...prev];
+            const copy = [...prev];
+            copy[i] = row;
+            return copy;
+          });
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "road_incidents",
+          filter: `journey_id=eq.${id}`,
+        },
+        () => toast.success("Roadblock report delivered to police."),
+      )
+      .subscribe((status) => setNetStatus(status));
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }
+
+  /* ── Actions ────────────────────────────────────────────────────────── */
+  async function fetchRoute(): Promise<DrivingRoute | null> {
+    if (!fix) {
+      toast.error("Waiting for a GPS fix before calculating a route.");
+      return null;
+    }
+    if (!hospital) {
+      toast.error("Select a destination hospital first.");
+      return null;
+    }
+    setRouting(true);
+    try {
+      const res = await fetch("/api/routing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          origin: { latitude: fix.latitude, longitude: fix.longitude },
+          destination: {
+            latitude: hospital.latitude,
+            longitude: hospital.longitude,
+          },
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast.error(data?.error ?? "Routing failed.");
+        return null;
+      }
+      return data as DrivingRoute;
+    } catch {
+      toast.error("Routing service unreachable — check your connection.");
+      return null;
+    } finally {
+      setRouting(false);
+    }
+  }
+
+  async function getRoute() {
+    const r = await fetchRoute();
+    if (!r) return;
+    routeRef.current = r.geometry;
+    setRoute(r);
+    setFitToken((t) => t + 1);
+    setPhase("PREVIEW");
+  }
+
+  async function startJourney() {
+    if (!route || !vehicleId || !hospitalId) return;
+    const { data, error } = await supabase
+      .from("journeys")
+      .insert({
+        ambulance_id: vehicleId,
+        destination_hospital_id: hospitalId,
+        status: "ACTIVE",
+        route_geometry: toGeoJson(route.geometry),
+        distance: route.distanceM,
+        estimated_duration: route.durationS,
+        started_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+    if (error || !data) {
+      toast.error("Could not start journey: " + error.message);
       return;
     }
-    setToast("Locating you…");
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        store.relocateAmbulance(
-          amb.id,
-          pos.coords.latitude,
-          pos.coords.longitude,
-        );
-        void store.loadHospitals([pos.coords.latitude, pos.coords.longitude], {
-          force: true,
-        });
-        setToast("Found you — searching nearby hospitals");
-      },
-      () => setToast("Location permission denied"),
-      { enableHighAccuracy: true, timeout: 10000 },
+    journeyIdRef.current = (data as { id: string }).id;
+    setJourneyId((data as { id: string }).id);
+    setAlerts([]);
+    setPhase("ACTIVE");
+    subscribeJourney((data as { id: string }).id);
+  }
+
+  async function endJourney() {
+    const id = journeyIdRef.current;
+    if (!id) return;
+    const { error } = await supabase
+      .from("journeys")
+      .update({ status: "COMPLETED", completed_at: new Date().toISOString() })
+      .eq("id", id);
+    if (error) {
+      toast.error("Could not end journey: " + error.message);
+      return;
+    }
+    // DB trigger resets ambulance status + clears pending alerts.
+    journeyIdRef.current = null;
+    routeRef.current = [];
+    setJourneyId(null);
+    setRoute(null);
+    setPhase("SELECT");
+    setEtaS(null);
+    setRemainingM(null);
+    setAlerts([]);
+    setHospitalId(null);
+    setSearch("");
+  }
+
+  async function recalculate() {
+    const r = await fetchRoute();
+    const id = journeyIdRef.current;
+    if (!r || !id) return;
+    routeRef.current = r.geometry;
+    setRoute(r);
+    setFitToken((t) => t + 1);
+    await supabase
+      .from("journeys")
+      .update({
+        route_geometry: toGeoJson(r.geometry),
+        distance: r.distanceM,
+        estimated_duration: r.durationS,
+      })
+      .eq("id", id);
+    toast.success("Route recalculated.");
+  }
+
+  async function reportIncident(type: IncidentType, description: string) {
+    if (!fix) {
+      toast.error("No GPS fix — cannot report location.");
+      return;
+    }
+    const { error } = await supabase.from("road_incidents").insert({
+      journey_id: journeyIdRef.current,
+      reported_by: driverId,
+      type,
+      description,
+      latitude: fix.latitude,
+      longitude: fix.longitude,
+    });
+    if (error) {
+      toast.error("Report failed: " + error.message);
+      return;
+    }
+    toast.success("Roadblock reported to traffic police.");
+  }
+
+  async function signOut() {
+    await supabase.auth.signOut();
+    router.replace("/login");
+    router.refresh();
+  }
+
+  /* ── Derived ────────────────────────────────────────────────────────── */
+  const hospitalOptions = React.useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return hospitals
+      .filter(
+        (h) =>
+          !q ||
+          h.name.toLowerCase().includes(q) ||
+          h.address.toLowerCase().includes(q),
+      )
+      .map((h) => ({
+        hospital: h,
+        distanceM: fix ? haversineMeters(fix, h) : null,
+      }))
+      .sort((a, b) => (a.distanceM ?? Infinity) - (b.distanceM ?? Infinity));
+  }, [hospitals, search, fix]);
+
+  const corridor = React.useMemo(
+    () =>
+      route ? junctionsWithRouteDistance(route.geometry, junctions, 400) : [],
+    [route, junctions],
+  );
+
+  const nextJunction = React.useMemo(() => {
+    if (!route || !fix || corridor.length === 0) return null;
+    const prog = routeEta(route.geometry, [fix.latitude, fix.longitude], null);
+    if (prog.remainingM == null) return null;
+    const along = route.geometry.length
+      ? routeProgressAlong(route.geometry, [fix.latitude, fix.longitude])
+      : 0;
+    const upcoming = corridor.find((c) => c.alongM > along + 30);
+    if (!upcoming) return null;
+    const j = junctions.find((x) => x.id === upcoming.junction.id);
+    if (!j) return null;
+    const dist = haversineMeters(fix, j);
+    const alert =
+      alerts.find((a) => a.junction_id === j.id && a.status !== "CLEARED") ??
+      null;
+    return {
+      junction: j,
+      distanceM: dist,
+      eta: estimateEtaSeconds(dist, fix.speed),
+      alert,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route, fix, corridor, junctions, alerts]);
+
+  const gpsOk = trk?.status === "tracking" || trk?.status === "waiting";
+  const netOk = netStatus === "SUBSCRIBED";
+  const offRoute = phase === "ACTIVE" && fromRouteM > 60;
+
+  const mapProps: MapViewProps = {
+    className: "h-full w-full",
+    ambulances: fix
+      ? [
+          {
+            id: "self",
+            position: [fix.latitude, fix.longitude],
+            heading: fix.heading,
+            label: vehicle?.vehicle_number ?? "This ambulance",
+            active: phase === "ACTIVE",
+            speedKmh: fix.speed != null ? Math.round(fix.speed * 3.6) : null,
+            destination: hospital?.name,
+          },
+        ]
+      : [],
+    junctions: junctions.map((j) => ({
+      id: j.id,
+      position: [j.latitude, j.longitude],
+      radiusM: j.geofence_radius,
+      label: j.name,
+      state: nextJunction?.junction.id === j.id ? "approaching" : "monitoring",
+    })),
+    hospitals: hospital
+      ? [
+          {
+            id: hospital.id,
+            position: [hospital.latitude, hospital.longitude],
+            label: hospital.name,
+          },
+        ]
+      : [],
+    routes: route ? [{ id: "self", points: route.geometry }] : [],
+    followId: phase === "ACTIVE" && fix ? "self" : null,
+    fit: fitToken ? { token: fitToken, bounds: route?.geometry ?? [] } : null,
+  };
+
+  /* ── Empty states ───────────────────────────────────────────────────── */
+  if (ambulances.length === 0) {
+    return (
+      <main className="flex min-h-screen items-center justify-center p-6">
+        <div className="max-w-md rounded-xl border border-warn/40 bg-ops-900 p-6">
+          <h1 className="font-display text-xl font-semibold uppercase tracking-wide text-warn">
+            No ambulance assigned
+          </h1>
+          <p className="mt-2 text-sm text-ops-300">
+            Your account is not linked to a vehicle yet. An administrator must
+            assign an ambulance to you from the admin dashboard before you can
+            start a journey.
+          </p>
+        </div>
+      </main>
     );
   }
 
-  const journey = amb ? getActiveJourneyFor(state, amb.id) : undefined;
-  const completedJourney = useMemo(
-    () =>
-      state.journeys.find(
-        (j) => j.id === amb?.lastCompletedJourneyId && j.status === "completed",
-      ),
-    [state.journeys, amb?.lastCompletedJourneyId],
-  );
-  const selectedHospital = state.hospitals.find(
-    (h) => h.id === amb?.selectedHospitalId,
-  );
-  const preview = amb?.previewRoute ?? null;
-  const stats = journey ? getJourneyStats(journey) : null;
-  const upcoming = journey ? getUpcomingJunctions(state, journey, 2) : [];
-  const next = upcoming[0] ?? null;
-  const nextAlert =
-    journey && next
-      ? getAlertForJourneyJunction(state, journey.id, next.junction.id)
-      : undefined;
-
-  if (!hydrated || !amb || !session)
-    return <Splash label="RapidRoute — Driver" />;
-
-  const picking = !journey && !completedJourney && !selectedHospital;
-
-  const routes = journey
-    ? [{ key: journey.id, coords: journey.route, kind: "active" as const }]
-    : preview
-      ? [
-          {
-            key: `preview-${amb.selectedHospitalId}`,
-            coords: preview.coords,
-            kind: "preview" as const,
-          },
-        ]
-      : [];
-
-  async function handleStart() {
-    setStarting(true);
-    try {
-      await store.startJourney(amb!.id);
-    } finally {
-      setStarting(false);
-    }
-  }
-
-  function toggleGps() {
-    if (gpsOn) {
-      store.detachGps();
-      setGpsOn(false);
-      setToast("Device GPS disabled — demo drive available");
-    } else {
-      store.attachGps(amb!.id, (msg) => {
-        setToast(msg);
-        setGpsOn(false);
-      });
-      setGpsOn(true);
-      setToast("Requesting GPS permission…");
-      if (state.sim.active) store.stopSim();
-    }
-  }
-
+  /* ── Render ─────────────────────────────────────────────────────────── */
   return (
-    <div className="flex h-[100dvh] flex-col overflow-hidden">
-      {/* ---------- header ---------- */}
-      <header
-        className={cn(
-          "flex h-14 shrink-0 items-center gap-2.5 border-b px-4",
-          journey
-            ? "border-emergency/40 bg-emergency/15"
-            : "border-line bg-panel",
-        )}
-      >
-        <Ambulance size={22} />
-        <span className="text-lg font-extrabold tracking-wider">
-          RAPIDROUTE
-        </span>
-        <span className="ml-auto" />
-        {journey ? (
-          <Chip tone="red">
-            <StatusDot tone="red" pulse /> EMERGENCY ACTIVE
-          </Chip>
-        ) : (
-          <Chip tone="green">
-            <StatusDot tone="green" /> SYSTEM ONLINE
-          </Chip>
-        )}
-        <Chip tone="neutral" className="font-mono">
-          {amb.number}
-        </Chip>
-        <button
-          onClick={toggleGps}
-          aria-label="Toggle device GPS"
-          className={cn(
-            "rounded-lg p-2 transition-colors",
-            gpsOn
-              ? "bg-route/15 text-route"
-              : "text-muted hover:bg-panel-2 hover:text-slate-100",
-          )}
-        >
-          <LocateFixed size={18} />
-        </button>
-        <button
-          onClick={() => {
-            store.signOut();
-            router.replace("/");
-          }}
-          aria-label="Sign out"
-          className="rounded-lg p-2 text-muted hover:bg-panel-2 hover:text-slate-100"
-        >
-          <LogOut size={18} />
-        </button>
-      </header>
-
-      {/* ---------- map ---------- */}
-      <div
-        className={cn(
-          "relative min-h-0 flex-1",
-          picking ? "min-h-[28dvh]" : "min-h-[35dvh]",
-        )}
-      >
-        <MapPanel
-          center={[amb.lat, amb.lng]}
-          zoom={14}
-          ambulances={[amb]}
-          junctions={state.junctions}
-          hospitals={state.hospitals}
-          routes={routes}
-          roadblocks={state.roadblocks.filter((r) => r.ambulanceId === amb.id)}
-          follow={journey ? [amb.lat, amb.lng] : null}
-          fitKey={
-            journey?.id ?? (preview ? `p-${amb.selectedHospitalId}` : "none")
-          }
-          fitCoords={journey?.route ?? preview?.coords ?? null}
-          selected={{
-            hospitalId:
-              journey?.hospitalId ?? amb.selectedHospitalId ?? undefined,
-          }}
-          alertedJunctionIds={state.alerts
-            .filter(
-              (a) => a.journeyId === journey?.id && a.status !== "cleared",
-            )
-            .map((a) => a.junctionId)}
-          recenterSignal={recenter}
-        />
-        <div className="absolute left-3 top-3 z-[500] flex flex-col gap-2">
-          {(state.sim.active || gpsOn) && (
-            <Chip tone={gpsOn ? "blue" : "amber"} className="shadow-lg">
-              {gpsOn ? "LIVE GPS" : "DEMO MODE — SIMULATED MOVEMENT"}
-            </Chip>
-          )}
-          {routes.length > 0 && (
-            <Chip tone="neutral" className="shadow-lg">
-              {routes[0].kind === "preview" ? "ROUTE PREVIEW" : "ACTIVE ROUTE"}{" "}
-              ·{" "}
-              {(journey?.routeSource ?? preview?.source) === "ors"
-                ? "ORS LIVE"
-                : "DEMO FALLBACK"}
-            </Chip>
+    <main className="mx-auto flex min-h-screen w-full max-w-lg flex-col">
+      {/* Status strip */}
+      <header className="sticky top-0 z-40 flex items-center justify-between gap-2 border-b border-ops-700 bg-ops-900/95 px-4 py-2.5 backdrop-blur">
+        <div className="flex items-center gap-2">
+          <Siren
+            className={cn(
+              "h-5 w-5",
+              phase === "ACTIVE" ? "text-emergency-bright" : "text-ops-400",
+            )}
+            aria-hidden="true"
+          />
+          <span className="font-display text-lg font-bold uppercase tracking-wide">
+            {vehicle?.vehicle_number}
+          </span>
+          {phase === "ACTIVE" ? (
+            <Badge variant="emergency">Emergency active</Badge>
+          ) : (
+            <Badge variant="neutral">Standby</Badge>
           )}
         </div>
-        <button
-          onClick={() => setRecenter((n) => n + 1)}
-          aria-label="Recenter on ambulance"
-          className="absolute bottom-[70px] right-3 z-[500] rounded-xl border border-line bg-ink/90 p-2.5 text-slate-100 shadow-lg backdrop-blur"
+        <div className="flex items-center gap-3 text-[11px] font-semibold uppercase tracking-wider">
+          <span
+            className={cn(
+              "flex items-center gap-1",
+              gpsOk ? "text-ok" : "text-warn",
+            )}
+            title={trk?.lastError?.message}
+          >
+            <Satellite className="h-4 w-4" aria-hidden="true" />
+            <span className="sr-only">GPS </span>
+            {trk?.status === "tracking"
+              ? "GPS"
+              : trk?.status === "waiting"
+                ? "GPS…"
+                : "GPS!"}
+          </span>
+          <span
+            className={cn(
+              "flex items-center gap-1",
+              phase !== "ACTIVE" || netOk ? "text-ok" : "text-warn",
+            )}
+          >
+            <Radio className="h-4 w-4" aria-hidden="true" />
+            <span className="sr-only">Network </span>NET
+          </span>
+          <button
+            onClick={signOut}
+            aria-label="Sign out"
+            className="text-ops-400 hover:text-white"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
+        </div>
+      </header>
+
+      {/* GPS problem banner — never pretend a location exists */}
+      {trk?.status === "error" && (
+        <div
+          role="alert"
+          className="m-3 flex items-start gap-2 rounded-lg border border-emergency/50 bg-emergency/10 p-3 text-sm text-emergency-bright"
         >
-          <LocateFixed size={18} />
-        </button>
-      </div>
+          <AlertTriangle
+            className="mt-0.5 h-4 w-4 shrink-0"
+            aria-hidden="true"
+          />
+          <span>
+            {trk.lastError?.message ??
+              "Location temporarily unavailable. Please check GPS permission."}
+          </span>
+        </div>
+      )}
 
-      {/* ---------- bottom sheet ---------- */}
-      <div
-        className={cn(
-          "shrink-0 overflow-y-auto border-t border-line bg-panel pb-safe",
-          picking ? "h-[64dvh]" : "max-h-[60dvh]",
-        )}
-      >
-        {journey && stats ? (
-          <div className="p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-2.5">
-                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-ink text-success">
-                  <Hospital size={20} />
-                </span>
-                <div>
-                  <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted">
-                    Destination
-                  </div>
-                  <div className="text-lg font-bold leading-tight">
-                    {journey.hospitalName}
-                  </div>
-                </div>
-              </div>
-              <Chip tone={journey.routeSource === "ors" ? "blue" : "neutral"}>
-                <RouteIcon size={12} />{" "}
-                {journey.routeSource === "ors" ? "ORS" : "DEMO"} ROUTE
-              </Chip>
-            </div>
-
-            <div className="mt-4 flex items-end gap-6">
-              <div>
-                <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted">
-                  ETA
-                </div>
-                <div className="font-mono text-5xl font-semibold leading-none">
-                  {fmtEta(stats.etaSec)}
-                </div>
-              </div>
-              <div>
-                <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted">
-                  Distance
-                </div>
-                <div className="font-mono text-2xl font-medium leading-none text-slate-200">
-                  {fmtDistance(stats.remainingM)}
-                </div>
-              </div>
-              {journey.routeLengthM > 0 && (
-                <div className="mb-1.5 ml-auto w-24">
-                  <div className="h-1.5 overflow-hidden rounded-full bg-line">
-                    <div
-                      className="h-full rounded-full bg-route"
-                      style={{
-                        width: `${Math.min(100, (journey.traveledM / journey.routeLengthM) * 100)}%`,
-                      }}
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="mt-4 rounded-xl border-l-4 border-amber bg-amber/10 p-3.5">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-amber">
-                    Next junction
-                  </div>
-                  <div className="text-lg font-bold leading-tight">
-                    {next ? next.junction.name : "Approaching destination"}
-                  </div>
-                </div>
-                {next && (
-                  <div className="text-right">
-                    <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-amber">
-                      Junction ETA
-                    </div>
-                    <div className="font-mono text-xl font-semibold text-amber">
-                      {fmtEta(next.etaSec)}
-                    </div>
-                  </div>
-                )}
-              </div>
-              {upcoming[1] && (
-                <div className="mt-2 text-xs text-muted">
-                  Then: {upcoming[1].junction.name.replace(" Junction", " Jn")}{" "}
-                  · {fmtEta(upcoming[1].etaSec)}
-                </div>
-              )}
-              {nextAlert && (
-                <div className="mt-2">
-                  {nextAlert.status === "pending" && (
-                    <Chip tone="amber">
-                      <Siren size={12} /> ALERT SENT TO POLICE
-                    </Chip>
-                  )}
-                  {nextAlert.status === "acknowledged" && (
-                    <Chip tone="green">
-                      <ShieldCheck size={12} /> POLICE ACKNOWLEDGED
-                    </Chip>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="mt-4 grid grid-cols-2 gap-3">
-              <Button
-                variant="amber"
-                size="lg"
-                onClick={() => setRoadblockOpen(true)}
-              >
-                <TriangleAlert size={18} /> REPORT ROADBLOCK
-              </Button>
-              <Button
-                variant="dangerOutline"
-                size="lg"
-                onClick={() => setEndConfirm(true)}
-              >
-                END JOURNEY
-              </Button>
-            </div>
-
-            <div className="mt-4 flex items-center gap-2">
-              {!gpsOn && (
-                <>
-                  <Button
-                    variant={state.sim.active ? "outline" : "primary"}
-                    size="md"
-                    className="flex-1"
-                    onClick={() =>
-                      state.sim.active ? store.stopSim() : store.startSim()
-                    }
-                  >
-                    {state.sim.active ? (
-                      <Pause size={16} />
-                    ) : (
-                      <Play size={16} />
-                    )}
-                    {state.sim.active ? "PAUSE DEMO DRIVE" : "START DEMO DRIVE"}
-                  </Button>
-                  <div className="flex overflow-hidden rounded-xl border border-line">
-                    {SPEEDS.map((s) => (
-                      <button
-                        key={s}
-                        onClick={() => store.setSimSpeed(s)}
-                        className={cn(
-                          "h-11 w-11 font-mono text-sm font-semibold transition-colors",
-                          state.sim.speed === s
-                            ? "bg-white text-ink"
-                            : "bg-panel text-muted hover:bg-panel-2",
-                        )}
-                      >
-                        {s}×
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
-            <p className="mt-2 text-[11px] text-muted">
-              {gpsOn
-                ? "Using device GPS — real position, simulated for demo when off-route."
-                : "Simulated movement along the route — not real GPS. ETA figures are real-world estimates."}
-            </p>
-          </div>
-        ) : completedJourney ? (
-          <div className="p-5">
-            <div className="flex items-center gap-3">
-              <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-success/15 text-success">
-                <CheckCircle2 size={26} />
+      <div className="flex-1 space-y-4 p-4 pb-36">
+        {/* Telemetry line */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-ops-400">
+          {fix ? (
+            <>
+              <span>±{Math.round(fix.accuracy)} m</span>
+              <span className="tabular">
+                {fix.latitude.toFixed(5)}, {fix.longitude.toFixed(5)}
               </span>
+              <span>{fmtSpeed(fix.speed)}</span>
+              <span>update {timeAgo(trk?.lastAcceptedAt ?? null, now)}</span>
+            </>
+          ) : (
+            <span>
+              {trk?.status === "waiting"
+                ? "Acquiring GPS signal…"
+                : "No GPS fix yet."}
+            </span>
+          )}
+        </div>
+
+        {phase === "SELECT" && (
+          <>
+            {ambulances.length > 1 && (
               <div>
-                <div className="text-xl font-extrabold text-success">
-                  JOURNEY COMPLETED
-                </div>
-                <div className="text-sm text-muted">
-                  {completedJourney.hospitalName} ·{" "}
-                  {fmtDistance(completedJourney.routeLengthM)} ·{" "}
-                  {completedJourney.durationSec
-                    ? fmtEta(completedJourney.durationSec)
-                    : "—"}{" "}
-                  elapsed
-                </div>
+                <Label htmlFor="vehicle">Vehicle</Label>
+                <select
+                  id="vehicle"
+                  value={vehicleId ?? ""}
+                  onChange={(e) => setVehicleId(e.target.value)}
+                  className="h-12 w-full rounded-lg border border-ops-600 bg-ops-850 px-3 text-base text-slate-100"
+                >
+                  {ambulances.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.vehicle_number}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div>
+              <Label htmlFor="hospital-search">Destination hospital</Label>
+              <div className="relative">
+                <Search
+                  className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ops-400"
+                  aria-hidden="true"
+                />
+                <Input
+                  id="hospital-search"
+                  className="h-12 pl-9 text-base"
+                  placeholder="Search hospitals…"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
               </div>
             </div>
-            <Button
-              variant="primary"
-              size="xl"
-              className="mt-5 w-full"
-              onClick={() => store.dismissCompletion(amb.id)}
-            >
-              START NEW JOURNEY
-            </Button>
-          </div>
-        ) : selectedHospital ? (
-          <div className="p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-2.5">
-                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-ink text-success">
-                  <Hospital size={20} />
-                </span>
+            {hospitals.length === 0 ? (
+              <p className="rounded-lg border border-ops-700 bg-ops-900 p-4 text-sm text-ops-300">
+                No hospitals configured yet. An administrator must add hospitals
+                before journeys can be planned.
+              </p>
+            ) : (
+              <ul
+                className="max-h-[42vh] space-y-2 overflow-y-auto"
+                role="listbox"
+                aria-label="Hospitals"
+              >
+                {hospitalOptions.map(({ hospital: h, distanceM }) => (
+                  <li key={h.id}>
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={hospitalId === h.id}
+                      onClick={() => setHospitalId(h.id)}
+                      className={cn(
+                        "flex w-full items-center gap-3 rounded-xl border p-4 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-warn",
+                        hospitalId === h.id
+                          ? "border-warn bg-warn/10"
+                          : "border-ops-700 bg-ops-900 hover:border-ops-600",
+                      )}
+                    >
+                      <Cross
+                        className="h-5 w-5 shrink-0 text-ok"
+                        aria-hidden="true"
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-display text-lg font-semibold uppercase leading-tight">
+                          {h.name}
+                        </span>
+                        <span className="block truncate text-xs text-ops-400">
+                          {h.address}
+                        </span>
+                      </span>
+                      {distanceM != null && (
+                        <span className="font-mono text-xs text-ops-300">
+                          {fmtDistance(distanceM)}
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                ))}
+                {hospitalOptions.length === 0 && (
+                  <li className="rounded-lg border border-ops-700 p-4 text-sm text-ops-400">
+                    No hospitals match your search.
+                  </li>
+                )}
+              </ul>
+            )}
+          </>
+        )}
+
+        {phase === "PREVIEW" && route && hospital && (
+          <>
+            <div className="rounded-xl border border-ops-700 bg-ops-900 p-4">
+              <p className="text-xs font-semibold uppercase tracking-wider text-ops-400">
+                Route to {hospital.name}
+              </p>
+              <div className="mt-2 flex items-end gap-6">
                 <div>
-                  <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted">
-                    Destination selected
-                  </div>
-                  <div className="text-lg font-bold leading-tight">
-                    {selectedHospital.name}
-                  </div>
+                  <p className="font-display text-5xl font-bold leading-none tabular">
+                    {fmtDuration(route.durationS)}
+                  </p>
+                  <p className="mt-1 text-xs uppercase tracking-wider text-ops-400">
+                    Estimated time
+                  </p>
+                </div>
+                <div>
+                  <p className="font-display text-5xl font-bold leading-none tabular">
+                    {fmtDistance(route.distanceM)}
+                  </p>
+                  <p className="mt-1 text-xs uppercase tracking-wider text-ops-400">
+                    Distance
+                  </p>
                 </div>
               </div>
-              <button
-                onClick={() => store.clearHospitalSelection(amb.id)}
-                className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold text-muted hover:bg-panel-2 hover:text-slate-100"
-              >
-                <ChevronLeft size={14} /> Change
-              </button>
+              <p className="mt-3 text-[11px] text-ops-400">
+                Estimate from{" "}
+                {route.provider === "osrm-demo"
+                  ? "OSRM demo server (testing only)"
+                  : route.provider}{" "}
+                routing — no live traffic data.
+                {route.warning ? ` ${route.warning}` : ""}
+              </p>
+            </div>
+            <div className="h-[38vh] min-h-64">
+              <DynamicMap {...mapProps} />
+            </div>
+          </>
+        )}
+
+        {phase === "ACTIVE" && (
+          <>
+            <div className="rounded-xl border border-emergency/40 bg-ops-900 p-4 text-center">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-ops-400">
+                ETA to {hospital?.name ?? "hospital"}
+              </p>
+              <p className="font-display text-7xl font-bold leading-none tabular text-white">
+                {fmtDuration(etaS ?? route?.durationS ?? null)}
+              </p>
+              <div className="mt-2 flex items-center justify-center gap-6 text-sm text-ops-300">
+                <span className="flex items-center gap-1.5">
+                  <RouteIcon className="h-4 w-4" aria-hidden="true" />
+                  {fmtDistance(remainingM)} left
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <Gauge className="h-4 w-4" aria-hidden="true" />
+                  {fmtSpeed(fix?.speed ?? null)}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] text-ops-400">
+                Routing estimate — no live traffic data.
+              </p>
             </div>
 
-            {preview ? (
-              <div className="mt-3 flex items-center gap-4 rounded-xl border border-line bg-ink p-4">
-                <div>
-                  <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted">
-                    Distance
-                  </div>
-                  <div className="font-mono text-2xl font-medium">
-                    {fmtDistance(preview.distanceM)}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted">
-                    Drive time
-                  </div>
-                  <div className="font-mono text-2xl font-medium">
-                    {fmtEta(preview.durationSec)}
-                  </div>
-                </div>
-                <Chip
-                  tone={preview.source === "ors" ? "blue" : "neutral"}
-                  className="ml-auto"
-                >
-                  {preview.source === "ors" ? "ORS LIVE ROUTE" : "DEMO ROUTE"}
-                </Chip>
-              </div>
-            ) : (
-              <div className="mt-3 flex items-center justify-center gap-2 rounded-xl border border-line bg-ink p-4 text-sm text-muted">
-                <span className="h-4 w-4 animate-spin rounded-full border-2 border-line border-t-slate-100" />
-                {amb.previewLoading ? "Calculating route…" : "Route ready"}
+            {/* Next junction + police coordination loop */}
+            <div className="rounded-xl border border-ops-700 bg-ops-900 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-ops-400">
+                Next junction
+              </p>
+              {nextJunction ? (
+                <>
+                  <p className="font-display text-3xl font-semibold uppercase leading-tight">
+                    {nextJunction.junction.name}
+                  </p>
+                  <p className="mt-1 font-mono text-sm text-ops-300 tabular">
+                    {fmtDistance(nextJunction.distanceM)} · ETA{" "}
+                    {fmtDuration(nextJunction.eta)}
+                  </p>
+                  <p className="mt-2 flex items-center gap-1.5 text-sm">
+                    {nextJunction.alert?.status === "ACKNOWLEDGED" ? (
+                      <span className="flex items-center gap-1.5 text-ok">
+                        <CheckCircle2 className="h-4 w-4" aria-hidden="true" />{" "}
+                        Traffic team notified
+                      </span>
+                    ) : nextJunction.alert ? (
+                      <span className="flex items-center gap-1.5 text-warn">
+                        <Siren className="h-4 w-4" aria-hidden="true" /> Alert
+                        sent — awaiting police acknowledgment
+                      </span>
+                    ) : (
+                      <span className="text-ops-400">
+                        No alert yet — geofence triggers automatically on
+                        approach.
+                      </span>
+                    )}
+                  </p>
+                </>
+              ) : (
+                <p className="mt-1 text-sm text-ops-400">
+                  No monitored junction ahead on this route.
+                </p>
+              )}
+            </div>
+
+            {offRoute && (
+              <div
+                role="alert"
+                className="flex items-center justify-between gap-3 rounded-xl border border-warn/50 bg-warn/10 p-4"
+              >
+                <span className="flex items-center gap-2 text-sm font-semibold text-warn">
+                  <Navigation className="h-4 w-4" aria-hidden="true" /> Off the
+                  planned route
+                </span>
+                <Button size="sm" variant="warn" onClick={recalculate}>
+                  Recalculate
+                </Button>
               </div>
             )}
 
-            <Button
-              variant="emergency"
-              size="xl"
-              className="mt-4 w-full"
-              onClick={handleStart}
-              disabled={!preview || starting}
-            >
-              <Siren size={22} />
-              {starting ? "STARTING…" : "START EMERGENCY ROUTE"}
-            </Button>
-          </div>
-        ) : (
-          <HospitalPicker
-            ambulanceLat={amb.lat}
-            ambulanceLng={amb.lng}
-            hospitals={state.hospitals}
-            live={state.live}
-            loading={state.hospitalsLoading}
-            onSelect={(hospitalId) =>
-              void store.previewRoute(amb.id, hospitalId)
-            }
-            onNearMe={handleNearMe}
-            onRetry={() =>
-              void store.loadHospitals([amb.lat, amb.lng], { force: true })
-            }
-          />
+            <div className="h-[34vh] min-h-56">
+              <DynamicMap {...mapProps} />
+            </div>
+          </>
         )}
       </div>
 
-      {/* ---------- overlays ---------- */}
-      <RoadblockSheet
-        open={roadblockOpen}
-        onClose={() => setRoadblockOpen(false)}
-        onSubmit={(type, note) => {
-          store.reportRoadblock(amb.id, type, note);
-          setToast("Traffic authorities have been notified.");
-        }}
-      />
-
-      <Modal
-        open={endConfirm}
-        onClose={() => setEndConfirm(false)}
-        title="End journey?"
-        footer={
-          <div className="grid grid-cols-2 gap-3">
+      {/* Bottom action bar — large, driving-safe controls */}
+      <div className="fixed bottom-0 left-1/2 z-40 w-full max-w-lg -translate-x-1/2 space-y-2 border-t border-ops-700 bg-ops-900/95 p-3 backdrop-blur">
+        {phase === "SELECT" && (
+          <Button
+            size="xl"
+            className="w-full"
+            disabled={!fix || !hospitalId || routing}
+            onClick={getRoute}
+          >
+            {routing ? "Calculating route…" : "Get route"}
+          </Button>
+        )}
+        {phase === "PREVIEW" && (
+          <>
             <Button
-              variant="outline"
-              size="lg"
-              onClick={() => setEndConfirm(false)}
+              size="xl"
+              variant="emergency"
+              className="w-full"
+              onClick={startJourney}
             >
-              CANCEL
+              <Siren className="h-6 w-6" aria-hidden="true" /> Start emergency
+              journey
             </Button>
             <Button
-              variant="emergency"
               size="lg"
+              variant="ghost"
+              className="w-full"
               onClick={() => {
-                store.endJourney(amb.id, false);
-                setEndConfirm(false);
-                setToast("Journey completed");
+                setPhase("SELECT");
+                setRoute(null);
+                routeRef.current = [];
               }}
             >
-              END JOURNEY
+              Change destination
+            </Button>
+          </>
+        )}
+        {phase === "ACTIVE" && (
+          <div className="grid grid-cols-2 gap-2">
+            <Button size="xl" variant="warn" onClick={() => setSheetOpen(true)}>
+              <TrafficCone className="h-5 w-5" aria-hidden="true" /> Report
+              roadblock
+            </Button>
+            <Button size="xl" variant="emergency" onClick={endJourney}>
+              End journey
             </Button>
           </div>
-        }
-      >
-        <p className="text-sm leading-relaxed text-muted">
-          The active emergency route to{" "}
-          {journey?.hospitalName ?? "your destination"} will be closed and
-          traffic police will see this journey as completed.
-        </p>
-      </Modal>
+        )}
+      </div>
 
-      {toast && <Toast message={toast} />}
+      {sheetOpen && (
+        <RoadblockSheet
+          hasFix={!!fix}
+          onClose={() => setSheetOpen(false)}
+          onSubmit={async (type, description) => {
+            await reportIncident(type, description);
+            setSheetOpen(false);
+          }}
+        />
+      )}
+    </main>
+  );
+}
+
+function routeProgressAlong(route: RoutePoint[], point: RoutePoint): number {
+  const prog = routeEta(route, point, 0);
+  void prog;
+  // Use raw progress (routeEta needs duration); compute directly:
+  const p = routeProgress(route, point);
+  return p.alongM;
+}
+// Minimal re-export to keep the import list honest (routeProgress used above).
+import { routeProgress } from "@/lib/routing/routeGeometry";
+
+function RoadblockSheet({
+  hasFix,
+  onClose,
+  onSubmit,
+}: {
+  hasFix: boolean;
+  onClose: () => void;
+  onSubmit: (type: IncidentType, description: string) => Promise<void>;
+}) {
+  const [type, setType] = React.useState<IncidentType>("ROAD_BLOCKED");
+  const [description, setDescription] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end bg-black/60"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Report roadblock"
+    >
+      <div className="mx-auto w-full max-w-lg rounded-t-2xl border-t border-ops-600 bg-ops-900 p-5 pb-8">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="font-display text-2xl font-bold uppercase">
+            Report roadblock
+          </h2>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-lg p-2 text-ops-400 hover:bg-ops-800 hover:text-white"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <div className="mb-4 grid grid-cols-2 gap-2">
+          {INCIDENT_TYPES.map((t) => (
+            <button
+              key={t.value}
+              type="button"
+              onClick={() => setType(t.value)}
+              aria-pressed={type === t.value}
+              className={cn(
+                "h-14 rounded-xl border text-sm font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-warn",
+                type === t.value
+                  ? "border-warn bg-warn/15 text-warn"
+                  : "border-ops-700 bg-ops-850 text-ops-300",
+              )}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <Label htmlFor="incident-desc">Description (optional)</Label>
+        <Textarea
+          id="incident-desc"
+          value={description}
+          maxLength={400}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="e.g. Lane closed near the flyover"
+        />
+        <p className="mt-2 text-xs text-ops-400">
+          {hasFix
+            ? "Your current GPS position will be attached."
+            : "No GPS fix — reporting is disabled until location is available."}
+        </p>
+        <Button
+          size="xl"
+          variant="warn"
+          className="mt-4 w-full"
+          disabled={!hasFix || busy}
+          onClick={async () => {
+            setBusy(true);
+            await onSubmit(type, description.trim());
+            setBusy(false);
+          }}
+        >
+          {busy ? "Sending…" : "Send report to police"}
+        </Button>
+      </div>
     </div>
   );
 }

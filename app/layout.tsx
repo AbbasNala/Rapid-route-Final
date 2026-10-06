@@ -1,28 +1,32 @@
-import type { Metadata, Viewport } from "next";
-import { Barlow, IBM_Plex_Mono } from "next/font/google";
+import type { Metadata } from "next";
+import { Barlow, Barlow_Condensed, IBM_Plex_Mono } from "next/font/google";
+import { ToastProvider } from "@/components/ui/toast";
 import "./globals.css";
 
-const barlow = Barlow({
+const sans = Barlow({
   subsets: ["latin"],
-  weight: ["400", "500", "600", "700", "800"],
+  weight: ["400", "500", "600", "700"],
   variable: "--font-sans",
+  display: "swap",
 });
-const plexMono = IBM_Plex_Mono({
+
+const display = Barlow_Condensed({
+  subsets: ["latin"],
+  weight: ["500", "600", "700"],
+  variable: "--font-display",
+  display: "swap",
+});
+const mono = IBM_Plex_Mono({
   subsets: ["latin"],
   weight: ["400", "500", "600"],
   variable: "--font-mono",
+  display: "swap",
 });
 
 export const metadata: Metadata = {
   title: "RapidRoute — Emergency Ambulance Traffic Coordination",
   description:
-    "Real-time coordination platform connecting ambulance drivers with traffic police. Demo prototype — does not control traffic signals.",
-};
-
-export const viewport: Viewport = {
-  themeColor: "#0B1220",
-  width: "device-width",
-  initialScale: 1,
+    "Real-time coordination between ambulance crews and traffic police. MVP — not certified for real emergency operations.",
 };
 
 export default function RootLayout({
@@ -31,9 +35,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`${barlow.variable} ${plexMono.variable}`}>
-      <body className="bg-ink font-sans text-slate-100 antialiased">
-        {children}
+    <html
+      lang="en"
+      className={`${sans.variable} ${display.variable} ${mono.variable}`}
+    >
+      <body className="min-h-screen bg-ops-950 font-sans text-[#E9F0F6] antialiased">
+        <ToastProvider>{children}</ToastProvider>
       </body>
     </html>
   );

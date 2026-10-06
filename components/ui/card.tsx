@@ -1,37 +1,45 @@
+import * as React from "react";
 import { cn } from "@/lib/utils";
-import type { HTMLAttributes, ReactNode } from "react";
 
-export function Panel({
+export function Card({
   className,
-  children,
-  ...rest
-}: HTMLAttributes<HTMLDivElement>) {
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn("rounded-2xl border border-line bg-panel", className)}
-      {...rest}
-    >
-      {children}
-    </div>
+      className={cn("rounded-xl border border-ops-700 bg-ops-900", className)}
+      {...props}
+    />
   );
 }
-
-export function SectionTitle({
-  icon,
-  title,
-  right,
-}: {
-  icon?: ReactNode;
-  title: string;
-  right?: ReactNode;
-}) {
+export function CardHeader({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) {
   return (
-    <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2">
-      <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.14em] text-muted">
-        {icon}
-        {title}
-      </div>
-      {right}
-    </div>
+    <div
+      className={cn("border-b border-ops-700 px-4 py-3", className)}
+      {...props}
+    />
   );
+}
+export function CardTitle({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLHeadingElement>) {
+  return (
+    <h2
+      className={cn(
+        "font-display text-sm font-semibold uppercase tracking-[0.14em] text-ops-300",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+export function CardContent({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) {
+  return <div className={cn("p-4", className)} {...props} />;
 }
